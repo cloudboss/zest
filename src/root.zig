@@ -8,6 +8,8 @@ pub const std_options: std.Options = .{
 
 var log_err_count: usize = 0;
 
+const TestList = std.ArrayList(std.builtin.TestFn);
+
 const Ansi = struct {
     pass: []const u8,
     fail: []const u8,
@@ -43,9 +45,102 @@ pub fn main() void {
     var skipped: usize = 0;
     var leaks: usize = 0;
 
+    var debug_alloc = std.heap.DebugAllocator(.{}){};
+    defer _ = debug_alloc.deinit();
+    const hook_allocator = debug_alloc.allocator();
+
+    var before_alls = std.StringHashMap(TestList).init(hook_allocator);
+    var after_alls = std.StringHashMap(TestList).init(hook_allocator);
+    var before_eaches = std.StringHashMap(TestList).init(hook_allocator);
+    var after_eaches = std.StringHashMap(TestList).init(hook_allocator);
+    var before_all_ran = std.StringHashMap(bool).init(hook_allocator);
+    var skipped_modules = std.StringHashMap(bool).init(hook_allocator);
+
+    defer cleanupHookMaps(
+        hook_allocator,
+        &before_alls,
+        &after_alls,
+        &before_eaches,
+        &after_eaches,
+        &before_all_ran,
+        &skipped_modules,
+    );
+
+    groupHooksByModule(
+        hook_allocator,
+        test_fns,
+        &before_alls,
+        &after_alls,
+        &before_eaches,
+        &after_eaches,
+    );
+
     const start = std.time.nanoTimestamp();
 
     for (test_fns) |t| {
+        // Skip function if it is a hook, for now.
+        if (isHook(t.name)) continue;
+
+        const prefix = getModulePrefix(t.name);
+
+        // Now ensure any beforeAll hook is run for the current test's module.
+        if (!before_all_ran.contains(prefix)) {
+            if (before_alls.get(prefix)) |hooks| {
+                for (hooks.items) |hook| {
+                    hook.func() catch |err| {
+                        std.debug.print("{s}  HOOK FAIL{s}  ", .{ a.fail, a.reset });
+                        std.debug.print("{s}: zest.beforeAll {s}(error.{s}){s}\n", .{ prefix, a.dim, @errorName(err), a.reset });
+
+                        // Mark module as skipped due to beforeAll failure. No further tests in this module will be run.
+                        skipped_modules.put(prefix, true) catch |put_err| {
+                            std.debug.print("Fatal: Failed to track skipped module: {s}\n", .{@errorName(put_err)});
+                            std.process.exit(1);
+                        };
+                        break;
+                    };
+                }
+            }
+            // Track that beforeAll has already run for the current test's module so it doesn't run again.
+            before_all_ran.put(prefix, true) catch |err| {
+                std.debug.print("Fatal: Failed to track zest.beforeAll execution: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            if (skipped_modules.contains(prefix)) continue;
+        }
+
+        const dn = DisplayName.from(t.name);
+
+        // Check if module should be skipped due to beforeAll failure.
+        if (skipped_modules.contains(prefix)) {
+            skipped += 1;
+            std.debug.print("{s}  SKIP{s}  ", .{ a.skip, a.reset });
+            dn.print(a);
+            std.debug.print(" {s}(module setup failed){s}\n", .{ a.dim, a.reset });
+            continue;
+        }
+
+        // Run the current test module's beforeEach hook, if any.
+        var skip_test = false;
+        if (before_eaches.get(prefix)) |hooks| {
+            for (hooks.items) |hook| {
+                hook.func() catch |err| {
+                    std.debug.print("{s}  HOOK FAIL{s}  ", .{ a.fail, a.reset });
+                    std.debug.print("{s}: zest.beforeEach {s}(error.{s}){s}\n", .{ prefix, a.dim, @errorName(err), a.reset });
+                    skip_test = true;
+                    break;
+                };
+            }
+        }
+
+        if (skip_test) {
+            skipped += 1;
+            std.debug.print("{s}  SKIP{s}  ", .{ a.skip, a.reset });
+            dn.print(a);
+            std.debug.print(" {s}(zest.beforeEach failed){s}\n", .{ a.dim, a.reset });
+            continue;
+        }
+
+        // Now set up the actual test.
         testing.allocator_instance = .{};
         defer {
             if (testing.allocator_instance.deinit() == .leak) {
@@ -56,8 +151,6 @@ pub fn main() void {
         log_err_count = 0;
 
         const t_start = std.time.nanoTimestamp();
-
-        const dn = DisplayName.from(t.name);
 
         if (t.func()) |_| {
             passed += 1;
@@ -90,6 +183,30 @@ pub fn main() void {
                 if (@errorReturnTrace()) |trace| {
                     std.debug.dumpStackTrace(trace.*);
                 }
+            }
+        }
+
+        // Run afterEach hook, even if test failed.
+        if (after_eaches.get(prefix)) |hooks| {
+            for (hooks.items) |hook| {
+                hook.func() catch |err| {
+                    std.debug.print("{s}  HOOK FAIL{s}  ", .{ a.fail, a.reset });
+                    std.debug.print("{s}: zest.afterEach {s}(error.{s}){s}\n", .{ prefix, a.dim, @errorName(err), a.reset });
+                };
+            }
+        }
+    }
+
+    // Run afterAll hook for all modules that ran tests.
+    var it = before_all_ran.keyIterator();
+    while (it.next()) |prefix_ptr| {
+        const prefix = prefix_ptr.*;
+        if (after_alls.get(prefix)) |hooks| {
+            for (hooks.items) |hook| {
+                hook.func() catch |err| {
+                    std.debug.print("{s}  HOOK FAIL{s}  ", .{ a.fail, a.reset });
+                    std.debug.print("{s}: zest.afterAll {s}(error.{s}){s}\n", .{ prefix, a.dim, @errorName(err), a.reset });
+                };
             }
         }
     }
@@ -132,6 +249,88 @@ pub fn main() void {
     if (failed > 0 or leaks > 0 or log_err_count > 0) {
         std.process.exit(1);
     }
+}
+
+fn getModulePrefix(name: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, name, ".test.")) |i| {
+        return name[0..i];
+    }
+    return "";
+}
+
+fn isHook(name: []const u8) bool {
+    const hooks = [_][]const u8{
+        ".zest.beforeAll",
+        ".zest.afterAll",
+        ".zest.beforeEach",
+        ".zest.afterEach",
+    };
+    for (hooks) |h| {
+        if (std.mem.endsWith(u8, name, h)) return true;
+    }
+    return false;
+}
+
+fn groupHooksByModule(
+    allocator: std.mem.Allocator,
+    test_fns: []const std.builtin.TestFn,
+    before_all_map: anytype,
+    after_all_map: anytype,
+    before_each_map: anytype,
+    after_each_map: anytype,
+) void {
+    for (test_fns) |t| {
+        const prefix = getModulePrefix(t.name);
+        if (std.mem.endsWith(u8, t.name, ".zest.beforeAll")) {
+            const entry = before_all_map.getOrPut(prefix) catch continue;
+            if (!entry.found_existing) {
+                entry.value_ptr.* = TestList.empty;
+            }
+            entry.value_ptr.append(allocator, t) catch continue;
+        } else if (std.mem.endsWith(u8, t.name, ".zest.afterAll")) {
+            const entry = after_all_map.getOrPut(prefix) catch continue;
+            if (!entry.found_existing) {
+                entry.value_ptr.* = TestList.empty;
+            }
+            entry.value_ptr.append(allocator, t) catch continue;
+        } else if (std.mem.endsWith(u8, t.name, ".zest.beforeEach")) {
+            const entry = before_each_map.getOrPut(prefix) catch continue;
+            if (!entry.found_existing) {
+                entry.value_ptr.* = TestList.empty;
+            }
+            entry.value_ptr.append(allocator, t) catch continue;
+        } else if (std.mem.endsWith(u8, t.name, ".zest.afterEach")) {
+            const entry = after_each_map.getOrPut(prefix) catch continue;
+            if (!entry.found_existing) {
+                entry.value_ptr.* = TestList.empty;
+            }
+            entry.value_ptr.append(allocator, t) catch continue;
+        }
+    }
+}
+
+fn cleanupHookMaps(
+    allocator: std.mem.Allocator,
+    before_alls: anytype,
+    after_alls: anytype,
+    before_eaches: anytype,
+    after_eaches: anytype,
+    before_all_ran: anytype,
+    skipped_modules: anytype,
+) void {
+    const maps = [_]*std.StringHashMap(TestList){
+        before_alls,
+        after_alls,
+        before_eaches,
+        after_eaches,
+    };
+    for (maps) |map| {
+        var it = map.valueIterator();
+        while (it.next()) |v| v.deinit(allocator);
+        map.deinit();
+    }
+    before_all_ran.deinit();
+    skipped_modules.deinit();
 }
 
 const DisplayName = struct {
