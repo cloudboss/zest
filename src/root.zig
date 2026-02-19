@@ -297,21 +297,25 @@ const Runner = struct {
     }
 };
 
-pub fn main() void {
+pub fn main() !void {
     const test_fns = builtin.test_functions;
 
     var debug_alloc = std.heap.DebugAllocator(.{}){};
-    defer _ = debug_alloc.deinit();
 
-    var runner = Runner.init(debug_alloc.allocator());
+    {
+        var runner = Runner.init(debug_alloc.allocator());
+        defer runner.deinit();
 
-    runner.groupHooksByModule(test_fns);
+        runner.groupHooksByModule(test_fns);
 
-    const start = std.time.nanoTimestamp();
+        const start = std.time.nanoTimestamp();
 
-    runner.runTests(test_fns);
+        runner.runTests(test_fns);
 
-    runner.printSummary(start);
+        runner.printSummary(start);
+    }
+
+    if (debug_alloc.deinit() == .leak) return error.MemoryLeak;
 }
 
 fn getModulePrefix(name: []const u8) []const u8 {
