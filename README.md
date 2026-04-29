@@ -22,7 +22,7 @@ Features:
 - Stack traces on failure
 - Enables defining setup and teardown hooks `zest.beforeAll`, `zest.afterAll`, `zest.beforeEach`, and `zest.afterEach`
 
-Requires Zig 0.15.0 or later.
+Requires Zig 0.16.0 or later.
 
 ## Usage
 

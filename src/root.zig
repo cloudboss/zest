@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const testing = std.testing;
 const builtin = @import("builtin");
 
@@ -35,6 +36,9 @@ const Ansi = struct {
 
 const Runner = struct {
     allocator: std.mem.Allocator,
+    io: Io,
+    args: std.process.Args,
+    environ: std.process.Environ,
     ansi: Ansi,
     passed: usize,
     failed: usize,
@@ -49,24 +53,25 @@ const Runner = struct {
 
     const Self = @This();
 
-    fn init(allocator: std.mem.Allocator) Self {
-        const ansi = if (std.fs.File.stderr().supportsAnsiEscapeCodes())
-            Ansi.on
-        else
-            Ansi.off;
+    fn init(p: std.process.Init) Self {
+        const supports_ansi = Io.File.stderr().supportsAnsiEscapeCodes(p.io) catch false;
+        const ansi = if (supports_ansi) Ansi.on else Ansi.off;
         return Self{
-            .allocator = allocator,
+            .allocator = p.gpa,
+            .io = p.io,
+            .args = p.minimal.args,
+            .environ = p.minimal.environ,
             .ansi = ansi,
             .passed = 0,
             .failed = 0,
             .leaks = 0,
             .skipped = 0,
-            .before_alls = std.StringHashMap(TestList).init(allocator),
-            .after_alls = std.StringHashMap(TestList).init(allocator),
-            .before_eaches = std.StringHashMap(TestList).init(allocator),
-            .after_eaches = std.StringHashMap(TestList).init(allocator),
-            .before_all_ran = std.StringHashMap(bool).init(allocator),
-            .skipped_modules = std.StringHashMap(bool).init(allocator),
+            .before_alls = std.StringHashMap(TestList).init(p.gpa),
+            .after_alls = std.StringHashMap(TestList).init(p.gpa),
+            .before_eaches = std.StringHashMap(TestList).init(p.gpa),
+            .after_eaches = std.StringHashMap(TestList).init(p.gpa),
+            .before_all_ran = std.StringHashMap(bool).init(p.gpa),
+            .skipped_modules = std.StringHashMap(bool).init(p.gpa),
         };
     }
 
@@ -181,7 +186,13 @@ const Runner = struct {
 
         // Now set up the actual test.
         testing.allocator_instance = .{};
+        testing.io_instance = .init(testing.allocator, .{
+            .argv0 = .init(self.args),
+            .environ = self.environ,
+        });
+        testing.environ = self.environ;
         defer {
+            testing.io_instance.deinit();
             if (testing.allocator_instance.deinit() == .leak) {
                 self.leaks += 1;
             }
@@ -189,11 +200,11 @@ const Runner = struct {
         testing.log_level = .warn;
         log_err_count = 0;
 
-        const t_start = std.time.nanoTimestamp();
+        const t_start = Io.Timestamp.now(self.io, .awake).nanoseconds;
 
         if (t.func()) |_| {
             self.passed += 1;
-            const d = duration(t_start);
+            const d = self.duration(t_start);
             std.debug.print("{s}  PASS{s}  ", .{ self.ansi.pass, self.ansi.reset });
             dn.print(self.ansi);
             std.debug.print(
@@ -208,7 +219,7 @@ const Runner = struct {
                 std.debug.print("\n", .{});
             } else {
                 self.failed += 1;
-                const d = duration(t_start);
+                const d = self.duration(t_start);
                 std.debug.print("{s}  FAIL{s}  ", .{ self.ansi.fail, self.ansi.reset });
                 dn.print(self.ansi);
                 std.debug.print(
@@ -220,7 +231,7 @@ const Runner = struct {
                     .{ self.ansi.fail, @errorName(err), self.ansi.reset },
                 );
                 if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
+                    std.debug.dumpErrorReturnTrace(trace);
                 }
             }
         }
@@ -256,8 +267,8 @@ const Runner = struct {
         }
     }
 
-    fn printSummary(self: *Self, start: i128) void {
-        const total = duration(start);
+    fn printSummary(self: *Self, start: i96) void {
+        const total = self.duration(start);
         std.debug.print("\n", .{});
 
         if (self.failed == 0 and self.leaks == 0) {
@@ -295,27 +306,42 @@ const Runner = struct {
             std.process.exit(1);
         }
     }
+
+    fn duration(self: *Self, start: i96) Duration {
+        const now = Io.Timestamp.now(self.io, .awake).nanoseconds;
+        const ns: u64 = @intCast(now - start);
+        if (ns < 1_000) return .{
+            .value = @floatFromInt(ns),
+            .unit = "ns",
+        };
+        if (ns < 1_000_000) return .{
+            .value = @as(f64, @floatFromInt(ns)) / 1_000.0,
+            .unit = "µs",
+        };
+        if (ns < 1_000_000_000) return .{
+            .value = @as(f64, @floatFromInt(ns)) / 1_000_000.0,
+            .unit = "ms",
+        };
+        return .{
+            .value = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0,
+            .unit = "s",
+        };
+    }
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) void {
     const test_fns = builtin.test_functions;
 
-    var debug_alloc = std.heap.DebugAllocator(.{}){};
+    var runner = Runner.init(init);
+    defer runner.deinit();
 
-    {
-        var runner = Runner.init(debug_alloc.allocator());
-        defer runner.deinit();
+    runner.groupHooksByModule(test_fns);
 
-        runner.groupHooksByModule(test_fns);
+    const start = Io.Timestamp.now(init.io, .awake).nanoseconds;
 
-        const start = std.time.nanoTimestamp();
+    runner.runTests(test_fns);
 
-        runner.runTests(test_fns);
-
-        runner.printSummary(start);
-    }
-
-    if (debug_alloc.deinit() == .leak) return error.MemoryLeak;
+    runner.printSummary(start);
 }
 
 fn getModulePrefix(name: []const u8) []const u8 {
@@ -369,26 +395,6 @@ const Duration = struct {
     unit: []const u8,
 };
 
-fn duration(start: i128) Duration {
-    const ns: u64 = @intCast(std.time.nanoTimestamp() - start);
-    if (ns < 1_000) return .{
-        .value = @floatFromInt(ns),
-        .unit = "ns",
-    };
-    if (ns < 1_000_000) return .{
-        .value = @as(f64, @floatFromInt(ns)) / 1_000.0,
-        .unit = "µs",
-    };
-    if (ns < 1_000_000_000) return .{
-        .value = @as(f64, @floatFromInt(ns)) / 1_000_000.0,
-        .unit = "ms",
-    };
-    return .{
-        .value = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0,
-        .unit = "s",
-    };
-}
-
 test "DisplayName.from simple module" {
     const dn = DisplayName.from("imds.test.parse");
     try testing.expectEqualStrings("imds", dn.module);
@@ -415,7 +421,7 @@ test "DisplayName.from no .test. delimiter" {
 
 pub fn log(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
