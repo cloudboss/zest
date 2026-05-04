@@ -127,6 +127,24 @@ const Runner = struct {
 
         const prefix = getModulePrefix(t.name);
 
+        // Set up the testing globals before any hooks run so beforeAll,
+        // beforeEach, and the test itself can all use std.testing.allocator,
+        // std.testing.io, and std.testing.environ.
+        testing.allocator_instance = .{};
+        testing.io_instance = .init(testing.allocator, .{
+            .argv0 = .init(self.args),
+            .environ = self.environ,
+        });
+        testing.environ = self.environ;
+        defer {
+            testing.io_instance.deinit();
+            if (testing.allocator_instance.deinit() == .leak) {
+                self.leaks += 1;
+            }
+        }
+        testing.log_level = .warn;
+        log_err_count = 0;
+
         // Now ensure any beforeAll hook is run for the current test's module.
         if (!self.before_all_ran.contains(prefix)) {
             if (self.before_alls.get(prefix)) |hooks| {
@@ -183,22 +201,6 @@ const Runner = struct {
             std.debug.print(" {s}(zest.beforeEach failed){s}\n", .{ self.ansi.dim, self.ansi.reset });
             return;
         }
-
-        // Now set up the actual test.
-        testing.allocator_instance = .{};
-        testing.io_instance = .init(testing.allocator, .{
-            .argv0 = .init(self.args),
-            .environ = self.environ,
-        });
-        testing.environ = self.environ;
-        defer {
-            testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() == .leak) {
-                self.leaks += 1;
-            }
-        }
-        testing.log_level = .warn;
-        log_err_count = 0;
 
         const t_start = Io.Timestamp.now(self.io, .awake).nanoseconds;
 
