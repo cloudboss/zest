@@ -259,13 +259,39 @@ const Runner = struct {
         while (iter.next()) |prefix_ptr| {
             const prefix = prefix_ptr.*;
             if (self.after_alls.get(prefix)) |hooks| {
-                for (hooks.items) |hook| {
-                    hook.func() catch |err| {
-                        std.debug.print("{s}  HOOK FAIL{s}  ", .{ self.ansi.fail, self.ansi.reset });
-                        std.debug.print("{s}: zest.afterAll {s}(error.{s}){s}\n", .{ prefix, self.ansi.dim, @errorName(err), self.ansi.reset });
-                    };
-                }
+                self.runAfterAll(prefix, hooks);
             }
+        }
+    }
+
+    fn runAfterAll(self: *Self, prefix: []const u8, hooks: TestList) void {
+        // Set up the testing globals so afterAll hooks can use
+        // std.testing.allocator and std.testing.io. The per-test runner
+        // tears these down in its defer, so by the time we get here the
+        // io storage is in an undefined state and any client that captured
+        // it during beforeAll would deadlock on the first vtable call.
+        testing.allocator_instance = .{};
+        testing.io_instance = .init(testing.allocator, .{
+            .argv0 = .init(self.args),
+            .environ = self.environ,
+        });
+        testing.environ = self.environ;
+        defer {
+            testing.io_instance.deinit();
+            if (testing.allocator_instance.deinit() == .leak) {
+                self.leaks += 1;
+            }
+        }
+        testing.log_level = .warn;
+
+        for (hooks.items) |hook| {
+            hook.func() catch |err| {
+                std.debug.print("{s}  HOOK FAIL{s}  ", .{ self.ansi.fail, self.ansi.reset });
+                std.debug.print(
+                    "{s}: zest.afterAll {s}(error.{s}){s}\n",
+                    .{ prefix, self.ansi.dim, @errorName(err), self.ansi.reset },
+                );
+            };
         }
     }
 
