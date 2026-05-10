@@ -40,6 +40,7 @@ const Runner = struct {
     args: std.process.Args,
     environ: std.process.Environ,
     ansi: Ansi,
+    default_log_level: std.log.Level,
     passed: usize,
     failed: usize,
     leaks: usize,
@@ -62,6 +63,7 @@ const Runner = struct {
             .args = p.minimal.args,
             .environ = p.minimal.environ,
             .ansi = ansi,
+            .default_log_level = resolveDefaultLogLevel(p.minimal.environ, p.gpa),
             .passed = 0,
             .failed = 0,
             .leaks = 0,
@@ -142,7 +144,7 @@ const Runner = struct {
                 self.leaks += 1;
             }
         }
-        testing.log_level = .warn;
+        testing.log_level = self.default_log_level;
         log_err_count = 0;
 
         // Now ensure any beforeAll hook is run for the current test's module.
@@ -377,6 +379,12 @@ fn getModulePrefix(name: []const u8) []const u8 {
         return name[0..i];
     }
     return "";
+}
+
+fn resolveDefaultLogLevel(environ: std.process.Environ, gpa: std.mem.Allocator) std.log.Level {
+    const raw = environ.getAlloc(gpa, "ZEST_LOG_LEVEL") catch return .warn;
+    defer gpa.free(raw);
+    return std.meta.stringToEnum(std.log.Level, raw) orelse .warn;
 }
 
 fn isHook(name: []const u8) bool {
