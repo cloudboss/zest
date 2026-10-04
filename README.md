@@ -22,7 +22,7 @@ Features:
 - Stack traces on failure
 - Enables defining setup and teardown hooks `zest.beforeAll`, `zest.afterAll`, `zest.beforeEach`, and `zest.afterEach`
 
-Requires Zig 0.16.0 or later.
+Requires Zig 0.17.0 or later.
 
 ## Usage
 
@@ -111,7 +111,7 @@ test "database persists across tests" {
 
 ## Development
 
-Run unit tests:
+Run unit and runner integration tests:
 
 ```
 zig build test

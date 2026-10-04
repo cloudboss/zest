@@ -9,7 +9,7 @@ pub const std_options: std.Options = .{
 
 var log_err_count: usize = 0;
 
-const TestList = std.ArrayList(std.builtin.TestFn);
+const TestList = std.ArrayList(std.lang.TestFn);
 
 const Ansi = struct {
     pass: []const u8,
@@ -93,7 +93,7 @@ const Runner = struct {
         self.skipped_modules.deinit();
     }
 
-    fn groupHooksByModule(self: *Self, test_fns: []const std.builtin.TestFn) void {
+    fn groupHooksByModule(self: *Self, test_fns: []const std.lang.TestFn) void {
         for (test_fns) |t| {
             const prefix = getModulePrefix(t.name);
             if (std.mem.endsWith(u8, t.name, ".zest.beforeAll")) {
@@ -124,7 +124,7 @@ const Runner = struct {
         }
     }
 
-    fn runTest(self: *Self, t: std.builtin.TestFn) void {
+    fn runTest(self: *Self, t: std.lang.TestFn) void {
         if (isHook(t.name)) return;
 
         const prefix = getModulePrefix(t.name);
@@ -132,7 +132,10 @@ const Runner = struct {
         // Set up the testing globals before any hooks run so beforeAll,
         // beforeEach, and the test itself can all use std.testing.allocator,
         // std.testing.io, and std.testing.environ.
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{
+            .canary = 0xc3a701ba,
+            .check_write_after_free = true,
+        });
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(self.args),
             .environ = self.environ,
@@ -140,7 +143,7 @@ const Runner = struct {
         testing.environ = self.environ;
         defer {
             testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() == .leak) {
+            if (testing.allocator_instance.deinit() != 0) {
                 self.leaks += 1;
             }
         }
@@ -251,7 +254,7 @@ const Runner = struct {
         }
     }
 
-    fn runTests(self: *Self, test_fns: []const std.builtin.TestFn) void {
+    fn runTests(self: *Self, test_fns: []const std.lang.TestFn) void {
         for (test_fns) |t| {
             self.runTest(t);
         }
@@ -272,7 +275,10 @@ const Runner = struct {
         // tears these down in its defer, so by the time we get here the
         // io storage is in an undefined state and any client that captured
         // it during beforeAll would deadlock on the first vtable call.
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{
+            .canary = 0xc3a701ba,
+            .check_write_after_free = true,
+        });
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(self.args),
             .environ = self.environ,
@@ -280,7 +286,7 @@ const Runner = struct {
         testing.environ = self.environ;
         defer {
             testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() == .leak) {
+            if (testing.allocator_instance.deinit() != 0) {
                 self.leaks += 1;
             }
         }
@@ -461,10 +467,10 @@ pub fn log(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
         log_err_count +|= 1;
     }
-    if (@intFromEnum(message_level) <= @intFromEnum(testing.log_level)) {
+    if (@backingInt(message_level) <= @backingInt(testing.log_level)) {
         std.debug.print(
             "[" ++ @tagName(scope) ++ "] (" ++ @tagName(message_level) ++ "): " ++ format ++ "\n",
             args,
